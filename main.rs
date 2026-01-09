@@ -1,124 +1,154 @@
 #![windows_subsystem = "windows"]
 
-
-// https://microsoft.github.io/windows-docs-rs/doc/windows/Win32/UI/WindowsAndMessaging/fn.GetDesktopWindow.html
 use log::{info, warn, error};
 use log4rs;
-use log4rs::{append::file::FileAppender, config::{Appender, Root}, encode::pattern::{PatternEncoder}, Config};
+use log4rs::{append::file::FileAppender, config::{Appender, Root}, encode::pattern::PatternEncoder, Config};
 
-use std::ffi::c_void;
-use std::ptr::{self};
-use windows::core::w;
-use windows::core::{IUnknown, Param, Interface, Result,PCWSTR};
+use windows::core::{Interface, Result, w};
 use windows::Win32::{
-    Foundation::{HWND, S_FALSE},
     System::{
         Com::{
-            CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_LOCAL_SERVER,
-            COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, 
+            CoCreateInstance, CoInitializeEx, CLSCTX_LOCAL_SERVER,
+            COINIT_APARTMENTTHREADED, IServiceProvider,
         },
-        Ole::{IEnumVARIANT},
-        Variant::{VARIANT,VT_DISPATCH},
+        Variant::VARIANT,
+        SystemServices::SFGAO_FILESYSTEM,
     },
     UI::Shell::{
-        IPersistIDList, IShellBrowser, IShellItem, IShellWindows, IUnknown_QueryService,
-        SHCreateItemFromIDList, SID_STopLevelBrowser, ShellWindows,
-        SIGDN_DESKTOPABSOLUTEPARSING
+        IShellBrowser, IShellWindows, IShellView, IShellItem, IFolderView,
+        ShellWindows, SIGDN_FILESYSPATH, SIGDN_DESKTOPABSOLUTEPARSING, SVGIO_SELECTION,
+        IShellItemArray
     },
-    UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK,GetForegroundWindow,GetWindowThreadProcessId}
+    UI::WindowsAndMessaging::{GetForegroundWindow, FindWindowExW, MessageBoxW, MB_ICONINFORMATION, MB_OK},
 };
+use windows::core::PCWSTR;
+use windows::Win32::System::Com::IDispatch;
 
-// 获取explorer.exe里selected file的路径
-fn get_location_from_view(browser: &IShellBrowser) -> Result<Vec<u16>> {
-    let shell_view = unsafe { browser.QueryActiveShellView() }?;
-    let persist_id_list: IPersistIDList = shell_view.cast()?;
-    let id_list = unsafe { persist_id_list.GetIDList() }?;
 
-    // let mut item = MaybeUninit::<IShellItem>::uninit();
-    // unsafe { SHCreateItemFromIDList(id_list, &IShellItem::IID, addr_of_mut!(item) as _) }?;
-    // let item = unsafe { item.assume_init() };
-    let item: IShellItem = unsafe { SHCreateItemFromIDList(id_list) }?;
+unsafe fn get_selected_file_from_explorer() -> Result<String> {
+    let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
-    let ptr = unsafe { item.GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING) }?;
+    let hwnd_gfw = GetForegroundWindow();
+    let shell_windows: IShellWindows =
+        CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER)?;
+    let result_hwnd = FindWindowExW(Some(hwnd_gfw), None, w!("ShellTabWindowClass"), None)?;
 
-    // Copy UTF-16 string to `Vec<u16>` (including NUL terminator)
-    let mut path = Vec::new();
-    let mut p = ptr.0 as *const u16;
-    loop {
-        let ch = unsafe { *p };
-        path.push(ch);
-        if ch == 0 {
-            break;
+    let mut target_path = String::new();
+    let count = shell_windows.Count().unwrap_or_default();
+
+    for i in 0..count {
+        let variant = VARIANT::from(i);
+        let dispatch: IDispatch = shell_windows.Item(&variant)?;
+
+        let shell_browser = dispath2browser(dispatch);
+
+        if shell_browser.is_none() {
+            continue;
         }
-        p = unsafe { p.add(1) };
-    }
-
-    // Cleanup
-    unsafe { 
-        CoTaskMemFree(Some(ptr.0 as *mut c_void));
-        CoTaskMemFree(Some(id_list as *const c_void));
-    }
-
-    Ok(path)
-}
-
-fn get_browser_info<'a, P>(unk: P, hwnd: &mut HWND) -> Result<Vec<u16>>
-where P: Param<IUnknown>,
-{
-    let shell_browser: IShellBrowser =
-        unsafe { IUnknown_QueryService(unk, &SID_STopLevelBrowser) }?;
-    *hwnd = unsafe { shell_browser.GetWindow() }?;
-
-    return get_location_from_view(&shell_browser)
-}
-
-fn dump_windows(windows: &IShellWindows) -> Result<()> {
-    let unk_enum = unsafe { windows._NewEnum() }?;
-    let enum_variant = unk_enum.cast::<IEnumVARIANT>()?;
-    loop {
-        let mut fetched = 0;
-        let mut var: [VARIANT; 1] = [VARIANT::default(); 1];
-        let hr = unsafe { enum_variant.Next(&mut var, &mut fetched) };
-        // No more windows?
-        if hr == S_FALSE || fetched == 0 {
-            break;
-        }
-        // Not an IDispatch interface?
-        if unsafe { var[0].Anonymous.Anonymous.vt } != VT_DISPATCH {
+        let shell_browser = shell_browser.unwrap();
+        // 调用 GetWindow 可能会阻塞 GUI 消息
+        let phwnd = shell_browser.GetWindow()?;
+        if hwnd_gfw.0 != phwnd.0 && result_hwnd.0 != phwnd.0 {
             continue;
         }
 
-        // Get the information
-        let mut hwnd = Default::default();
-        let location = get_browser_info(
-            unsafe {
-                var[0].Anonymous.Anonymous.Anonymous.pdispVal.as_ref().unwrap()
-            },
-            &mut hwnd,
-        )?;
+        let shell_view = shell_browser.QueryActiveShellView().unwrap();
+        target_path = get_base_location_from_shellview(shell_view); // get_selected_file_path_from_shellview(shell_view);
+    }
+    info!("get_selected_file_from_explorer: {}",target_path);
+    Ok(target_path)
+}
 
-        let is_active_hwnd = unsafe {
-            let foreground_hwnd = GetForegroundWindow();
-            let foreground_thread_id =  GetWindowThreadProcessId(foreground_hwnd, None);
-            let explorer_thread_id =  GetWindowThreadProcessId(hwnd, None);
+unsafe fn dispath2browser(dispatch: IDispatch) -> Option<IShellBrowser> {
+    
+    let mut service_provider: Option<IServiceProvider> = None;
+    dispatch
+        .query(
+            &IServiceProvider::IID,
+            &mut service_provider as *mut _ as *mut _,
+        )
+        .ok()
+        .unwrap();
+    if service_provider.is_none() {
+        return None;
+    }
+    let shell_browser = service_provider
+        .unwrap()
+        .QueryService::<IShellBrowser>(&IShellBrowser::IID)
+        .ok();
+    shell_browser
+}
 
-            // Convert UTF-16 to UTF-8 for display
-            let location = String::from_utf16_lossy(&location);
-            info!("Explorer location: \"{}\" {}", location, format!("hwnd: {hwnd:#?}; {foreground_hwnd:#?}"));
+unsafe fn get_selected_file_path_from_shellview(shell_view: IShellView) -> String {
+    let mut target_path = String::new();
+    let shell_items = shell_view.GetItemObject::<IShellItemArray>(SVGIO_SELECTION);
 
-            foreground_thread_id == explorer_thread_id
-        };
+    if shell_items.is_err() {
+        return target_path;
+    }
+    info!("shell_items: {:?}", shell_items);
+    let shell_items = shell_items.unwrap();
+    let count = shell_items.GetCount().unwrap_or_default();
+    for i in 0..count {
+        let shell_item = shell_items.GetItemAt(i).unwrap();
 
-        if is_active_hwnd {
-            unsafe {
-                MessageBoxW(None, PCWSTR(location.as_ptr()), w!("Hello"), MB_ICONINFORMATION | MB_OK);
+        // 如果不是文件对象则继续循环
+        if let Ok(attrs) = shell_item.GetAttributes(SFGAO_FILESYSTEM) {
+            log::info!("attrs: {:?}", attrs);
+            if attrs.0 == 0 {
+                continue;
+            }
+        }
+
+        if let Ok(display_name) = shell_item.GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING)
+        {
+            let tmp = display_name.to_string();
+            if tmp.is_err() {
+                continue;
+            }
+            target_path = tmp.unwrap();
+            break;
+        }
+
+        if let Ok(display_name) = shell_item.GetDisplayName(SIGDN_FILESYSPATH) {
+            println!("display_name: {:?}", display_name);
+            let tmp = display_name.to_string();
+            if tmp.is_err() {
+                println!("display_name error: {:?}", tmp.err());
+                continue;
+            }
+            target_path = tmp.unwrap();
+            break;
+        }
+        
+    }
+    target_path
+}
+
+unsafe fn get_base_location_from_shellview(shell_view: IShellView) -> String {
+    let mut base_path = String::new();
+    
+    // Try to get the current folder from the shell view
+    // We need to query for IFolderView interface to get folder information
+    if let Ok(folder_view) = shell_view.cast::<windows::Win32::UI::Shell::IFolderView>() {
+        if let Ok(folder) = folder_view.GetFolder::<IShellItem>() {
+            // Try to get the file system path first
+            if let Ok(display_name) = folder.GetDisplayName(SIGDN_FILESYSPATH) {
+                if let Ok(path_str) = display_name.to_string() {
+                    base_path = path_str;
+                }
+            }
+            // Fallback to desktop absolute parsing name
+            else if let Ok(display_name) = folder.GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING) {
+                if let Ok(path_str) = display_name.to_string() {
+                    base_path = path_str;
+                }
             }
         }
     }
-
-    Ok(())
+    
+    base_path
 }
-
 
 fn main() -> Result<()> {
 
@@ -144,33 +174,23 @@ fn main() -> Result<()> {
     log4rs::init_config(config).unwrap();
 
     // Log some messages
-    info!("This is an info message.");
+    info!("This is an info message.-------------->");
     warn!("This is a warning message.");
     error!("This is an error message.");
 
-    // 获取控制台窗口句柄
-    // let console_window = unsafe { GetConsoleWindow() };
-    // if console_window.0 != 0 {
-    //	println!("HIddee");
-    //    // 隐藏控制台窗口
-    //    unsafe { ShowWindow(console_window, SW_HIDE); }
-    //}
 
-    // unsafe {
-    // MessageBoxW(None, w!("Hello"), w!("World"), MB_ICONINFORMATION | MB_OK);
-    // } 
-
-    let _ = unsafe {
-        CoInitializeEx(
-            Some(ptr::null() as *const c_void),
-            COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE,
-        )
-    };
-
-    let windows: IShellWindows = unsafe { 
-        CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER) 
-    }?;
-    dump_windows(&windows)?;
-
+    let result = unsafe { get_selected_file_from_explorer() };
+    match result {
+        Ok(path) => {
+            info!("result is {:?} <-------------------", path);
+            let wide_path: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+            unsafe {
+                MessageBoxW(None, PCWSTR(wide_path.as_ptr()), w!("Selected File"), MB_ICONINFORMATION | MB_OK);
+            }
+        }
+        Err(e) => {
+            error!("Error getting selected file: {:?}", e);
+        }
+    }
     Ok(())
 }
