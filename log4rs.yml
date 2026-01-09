@@ -1,0 +1,23 @@
+appenders:
+  stdout:
+    kind: console
+    encoder:
+      pattern: "{d} [{l}] - {m}{n}"
+
+  file:
+    kind: file
+    path: "log.json"
+    encoder:
+      json:
+        # Optionally, you can define the structure of the JSON log
+        # `m` is the message, `l` is the log level, `d` is the date
+        # Here, we are logging a message, level, and timestamp
+        include_timestamp: true
+        include_level: true
+        include_message: true
+
+root:
+  level: info
+  appenders:
+    - file
+

@@ -1,0 +1,20 @@
+# Rust
+/target/
+Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+log.json
+
+# Temporary files
+*.tmp
+*.swp
+*~
