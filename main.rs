@@ -123,7 +123,7 @@ fn dump_windows(windows: &IShellWindows) -> Result<()> {
 fn main() -> Result<()> {
 
     // Initialize logging from the configuration file
-    // log4rs::init_file("d:\\myproject\\win-dir-wrapper\\log4rs.yml", Default::default()).unwrap();
+    // log4rs::init_file("d:\\myproject\\win-dir-forwarder\\log4rs.yml", Default::default()).unwrap();
 
     // Create a custom JSON encoder
     let json_encoder = Box::new(PatternEncoder::new("{d} [{l}] - {m}{n}"));
@@ -131,7 +131,7 @@ fn main() -> Result<()> {
     // Create a file appender with the custom encoder
     let file_appender = FileAppender::builder()
         .encoder(json_encoder)
-        .build("d:\\myproject\\win-dir-wrapper\\log.json")
+        .build("d:\\myproject\\win-dir-forwarder\\logs\\log.json")
         .unwrap();
 
     // Create a log configuration with the file appender
