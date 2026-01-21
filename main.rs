@@ -4,8 +4,9 @@ use log::{info, warn, error};
 use log4rs;
 use log4rs::{append::file::FileAppender, config::{Appender, Root}, encode::pattern::PatternEncoder, Config};
 
-use windows::core::{Interface, Result, w, PWSTR};
+use windows::core::{Interface, Result, w, PWSTR,Error};
 use windows::Win32::{
+    UI::WindowsAndMessaging::{GetWindow, GW_HWNDNEXT},
     System::{
         Com::{
             CoCreateInstance, CoInitializeEx, CLSCTX_LOCAL_SERVER,
@@ -13,7 +14,7 @@ use windows::Win32::{
         },
         Variant::VARIANT,
         SystemServices::SFGAO_FILESYSTEM,
-        Threading::{GetProcessId, OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_NAME_WIN32},
+        Threading::{GetProcessId, OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_NAME_WIN32, Sleep},
     },
     UI::Shell::{
         IShellBrowser, IShellWindows, IShellView, IShellItem, IFolderView,
@@ -65,27 +66,37 @@ unsafe fn get_selected_file_from_explorer() -> Result<String> {
 	info!("get_selected_file_from_explorer -->");
     let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
-    let hwnd_gfw = GetForegroundWindow();
-    let shell_windows: IShellWindows = CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER)?;
+    let mut foreground_hwnd = GetForegroundWindow();
+    let foreground_exe = get_process_path_from_hwnd(foreground_hwnd);
+    let foreground_title = get_window_title(foreground_hwnd);
+    info!("Foreground window handle: {:?}, title: '{}', exe: {}", foreground_hwnd, foreground_title, foreground_exe);
+
+    if !foreground_exe.to_lowercase().ends_with("\\explorer.exe") {
+        Sleep(100);
+        foreground_hwnd = GetForegroundWindow();
+        let foreground_exe = get_process_path_from_hwnd(foreground_hwnd);
+        let foreground_title = get_window_title(foreground_hwnd);
+        info!("After sleep, foreground window handle: {:?}, title: '{}', exe: {}", foreground_hwnd, foreground_title, foreground_exe);
+        if !foreground_exe.to_lowercase ().ends_with("\\explorer.exe") {
+            return Result::Err(Error::from_win32());
+        }
+    }
+
+    // Try to find ShellTabWindowClass child window
+    let result_hwnd_result = FindWindowExW(Some(foreground_hwnd), None, w!("ShellTabWindowClass"), None);
 
     let mut target_path = String::new();
+
+    let shell_windows: IShellWindows = CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER)?;
     let count = shell_windows.Count().unwrap_or_default();
     info!("Shell windows count: {}", count);
 
-    let foreground_exe = get_process_path_from_hwnd(hwnd_gfw);
-    let foreground_title = get_window_title(hwnd_gfw);
-    info!("Foreground window handle: {:?}, title: '{}', exe: {}", hwnd_gfw, foreground_title, foreground_exe);
-
-    // Try to find ShellTabWindowClass child window
-    let result_hwnd_result = FindWindowExW(Some(hwnd_gfw), None, w!("ShellTabWindowClass"), None);
 
     if let Ok(result_hwnd) = result_hwnd_result {
         // If we found ShellTabWindowClass, match against it
         info!("Found ShellTabWindowClass, matching shell windows against it");
         for i in 0..count {
-            let variant = VARIANT::from(i);
-            let dispatch: IDispatch = shell_windows.Item(&variant)?;
-
+            let dispatch: IDispatch = shell_windows.Item(&VARIANT::from(i))?;
             let shell_browser = dispath2browser(dispatch);
 
             if shell_browser.is_none() {
@@ -100,7 +111,7 @@ unsafe fn get_selected_file_from_explorer() -> Result<String> {
             info!("Shell window {} handle: {:?}, title: '{}', exe: {}", i, phwnd, window_title, window_exe);
 
             // Just match the foreground window directly
-            if result_hwnd.0 != phwnd.0 {
+            if result_hwnd.0 != phwnd.0 && foreground_hwnd.0 != phwnd.0 {
                 info!("Window {} doesn't match foreground, skipping", i);
                 continue;
             }
@@ -111,95 +122,11 @@ unsafe fn get_selected_file_from_explorer() -> Result<String> {
             info!("Got target path: {}", target_path);
             break;
         }
-    } else {
-        // If FindWindowExW failed, use Z-order to find the latest active shell window
-        info!("FindWindowExW failed, using Z-order to find latest active shell window");
+        info!("get_selected_file_from_explorer: <-- {}",target_path);
+        return Ok(target_path);
+    } 
 
-        for i in 0..count {
-            let variant = VARIANT::from(i);
-            let dispatch: IDispatch = shell_windows.Item(&variant)?;
-
-            let shell_browser = dispath2browser(dispatch);
-
-            if shell_browser.is_none() {
-                info!("Shell browser {} is none, skipping", i);
-                continue;
-            }
-            let shell_browser = shell_browser.unwrap();
-
-            let phwnd = shell_browser.GetWindow()?;
-            let window_exe = get_process_path_from_hwnd(phwnd);
-            let window_title = get_window_title(phwnd);
-            info!("Z-order search: Window {} handle: {:?}, title: '{}', exe: {}", i, phwnd, window_title, window_exe);
-
-            // Check if this window is visible and not minimized
-            if !IsWindowVisible(phwnd).as_bool() {
-                info!("Z-order search: Window {} is not visible, skipping", i);
-                continue;
-            }
-
-            if IsIconic(phwnd).as_bool() {
-                info!("Z-order search: Window {} is minimized, skipping", i);
-                continue;
-            }
-
-            // Found the first visible, non-minimized Explorer window (latest active by Z-order)
-            info!("Z-order search: Found latest active shell window {} (title: '{}', exe: {})", i, window_title, window_exe);
-            let shell_view = shell_browser.QueryActiveShellView().unwrap();
-            target_path = get_base_location_from_shellview(shell_view);
-            info!("Got target path from Z-order search: {}", target_path);
-            break;
-        }
-    }
-    // If foreground window is not Explorer, find the last lost focus Explorer window
-    if target_path.is_empty() {
-        info!("Foreground window is not Explorer, searching for last lost focus Explorer window");
-
-        // IShellWindows returns windows in Z-order (top to bottom)
-        // The first visible, non-minimized Explorer window that's not the foreground
-        // is the most recently active (last lost focus) Explorer window
-        for i in 0..count {
-            let variant = VARIANT::from(i);
-            let dispatch: IDispatch = shell_windows.Item(&variant)?;
-
-            let shell_browser = dispath2browser(dispatch);
-            if shell_browser.is_none() {
-                continue;
-            }
-            let shell_browser = shell_browser.unwrap();
-
-            let phwnd = shell_browser.GetWindow()?;
-            let window_exe = get_process_path_from_hwnd(phwnd);
-            let window_title = get_window_title(phwnd);
-
-            // Skip if this is the foreground window (already checked)
-            if hwnd_gfw.0 == phwnd.0 {
-                info!("Last lost focus search: Window {} is the foreground window, skipping", i);
-                continue;
-            }
-
-            // Check if window is visible and not minimized
-            if !IsWindowVisible(phwnd).as_bool() {
-                info!("Last lost focus search: Window {} (title: '{}', exe: {}) is not visible, skipping", i, window_title, window_exe);
-                continue;
-            }
-
-            if IsIconic(phwnd).as_bool() {
-                info!("Last lost focus search: Window {} (title: '{}', exe: {}) is minimized, skipping", i, window_title, window_exe);
-                continue;
-            }
-
-            // Found the last lost focus Explorer window (first in Z-order that's not foreground)
-            info!("Found last lost focus Explorer window {} (title: '{}', exe: {})", i, window_title, window_exe);
-            let shell_view = shell_browser.QueryActiveShellView().unwrap();
-            target_path = get_base_location_from_shellview(shell_view);
-            info!("Got target path from last lost focus Explorer: {}", target_path);
-            break;
-        }
-    }
-
-    info!("get_selected_file_from_explorer: <-- {}",target_path);
-    Ok(target_path)
+    return Result::Err(Error::from_win32());
 }
 
 unsafe fn dispath2browser(dispatch: IDispatch) -> Option<IShellBrowser> {
