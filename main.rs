@@ -4,7 +4,7 @@ use log::{info, warn, error};
 use log4rs;
 use log4rs::{append::file::FileAppender, config::{Appender, Root}, encode::pattern::PatternEncoder, Config};
 
-use windows::core::{Interface, Result, w};
+use windows::core::{Interface, Result, w, PWSTR};
 use windows::Win32::{
     System::{
         Com::{
@@ -13,63 +13,206 @@ use windows::Win32::{
         },
         Variant::VARIANT,
         SystemServices::SFGAO_FILESYSTEM,
+        Threading::{GetProcessId, OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_NAME_WIN32},
     },
     UI::Shell::{
         IShellBrowser, IShellWindows, IShellView, IShellItem, IFolderView,
         ShellWindows, SIGDN_FILESYSPATH, SIGDN_DESKTOPABSOLUTEPARSING, SVGIO_SELECTION,
         IShellItemArray
     },
-    UI::WindowsAndMessaging::{GetForegroundWindow, FindWindowExW, MessageBoxW, MB_ICONINFORMATION, MB_OK},
+    UI::WindowsAndMessaging::{GetForegroundWindow, FindWindowExW, MessageBoxW, MB_ICONINFORMATION, MB_OK, IsWindowVisible, IsIconic, GetWindowThreadProcessId, GetWindowTextW},
 };
 use windows::core::PCWSTR;
 use windows::Win32::System::Com::IDispatch;
+use std::process::Command;
+use std::env;
 
+unsafe fn get_window_title(hwnd: windows::Win32::Foundation::HWND) -> String {
+    let mut buffer: [u16; 512] = [0; 512];
+    let length = GetWindowTextW(hwnd, &mut buffer);
+
+    if length > 0 {
+        String::from_utf16_lossy(&buffer[0..length as usize])
+    } else {
+        String::from("(No Title)")
+    }
+}
+
+unsafe fn get_process_path_from_hwnd(hwnd: windows::Win32::Foundation::HWND) -> String {
+    let mut process_id: u32 = 0;
+    GetWindowThreadProcessId(hwnd, Some(&mut process_id));
+
+    if process_id == 0 {
+        return String::from("Unknown");
+    }
+
+    let process_handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id);
+    if let Ok(handle) = process_handle {
+        let mut buffer: [u16; 1024] = [0; 1024];
+        let mut size: u32 = buffer.len() as u32;
+        let mut pwstr = PWSTR(buffer.as_mut_ptr());
+
+        if QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, pwstr, &mut size).is_ok() {
+            let path = String::from_utf16_lossy(&buffer[0..size as usize]);
+            return path;
+        }
+    }
+
+    String::from("Unknown")
+}
 
 unsafe fn get_selected_file_from_explorer() -> Result<String> {
+	info!("get_selected_file_from_explorer -->");
     let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
     let hwnd_gfw = GetForegroundWindow();
-    let shell_windows: IShellWindows =
-        CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER)?;
-    let result_hwnd = FindWindowExW(Some(hwnd_gfw), None, w!("ShellTabWindowClass"), None)?;
+    let shell_windows: IShellWindows = CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER)?;
 
     let mut target_path = String::new();
     let count = shell_windows.Count().unwrap_or_default();
+    info!("Shell windows count: {}", count);
 
-    for i in 0..count {
-        let variant = VARIANT::from(i);
-        let dispatch: IDispatch = shell_windows.Item(&variant)?;
+    let foreground_exe = get_process_path_from_hwnd(hwnd_gfw);
+    let foreground_title = get_window_title(hwnd_gfw);
+    info!("Foreground window handle: {:?}, title: '{}', exe: {}", hwnd_gfw, foreground_title, foreground_exe);
 
-        let shell_browser = dispath2browser(dispatch);
+    // Try to find ShellTabWindowClass child window
+    let result_hwnd_result = FindWindowExW(Some(hwnd_gfw), None, w!("ShellTabWindowClass"), None);
 
-        if shell_browser.is_none() {
-            continue;
+    if let Ok(result_hwnd) = result_hwnd_result {
+        // If we found ShellTabWindowClass, match against it
+        info!("Found ShellTabWindowClass, matching shell windows against it");
+        for i in 0..count {
+            let variant = VARIANT::from(i);
+            let dispatch: IDispatch = shell_windows.Item(&variant)?;
+
+            let shell_browser = dispath2browser(dispatch);
+
+            if shell_browser.is_none() {
+                info!("Shell browser {} is none, skipping", i);
+                continue;
+            }
+            let shell_browser = shell_browser.unwrap();
+            // 调用 GetWindow 可能会阻塞 GUI 消息
+            let phwnd = shell_browser.GetWindow()?;
+            let window_exe = get_process_path_from_hwnd(phwnd);
+            let window_title = get_window_title(phwnd);
+            info!("Shell window {} handle: {:?}, title: '{}', exe: {}", i, phwnd, window_title, window_exe);
+
+            // Just match the foreground window directly
+            if result_hwnd.0 != phwnd.0 {
+                info!("Window {} doesn't match foreground, skipping", i);
+                continue;
+            }
+
+            info!("Found matching window {}, getting active shell view", i);
+            let shell_view = shell_browser.QueryActiveShellView().unwrap();
+            target_path = get_base_location_from_shellview(shell_view); // get_selected_file_path_from_shellview(shell_view);
+            info!("Got target path: {}", target_path);
+            break;
         }
-        let shell_browser = shell_browser.unwrap();
-        // 调用 GetWindow 可能会阻塞 GUI 消息
-        let phwnd = shell_browser.GetWindow()?;
-        if hwnd_gfw.0 != phwnd.0 && result_hwnd.0 != phwnd.0 {
-            continue;
-        }
+    } else {
+        // If FindWindowExW failed, use Z-order to find the latest active shell window
+        info!("FindWindowExW failed, using Z-order to find latest active shell window");
 
-        let shell_view = shell_browser.QueryActiveShellView().unwrap();
-        target_path = get_base_location_from_shellview(shell_view); // get_selected_file_path_from_shellview(shell_view);
+        for i in 0..count {
+            let variant = VARIANT::from(i);
+            let dispatch: IDispatch = shell_windows.Item(&variant)?;
+
+            let shell_browser = dispath2browser(dispatch);
+
+            if shell_browser.is_none() {
+                info!("Shell browser {} is none, skipping", i);
+                continue;
+            }
+            let shell_browser = shell_browser.unwrap();
+
+            let phwnd = shell_browser.GetWindow()?;
+            let window_exe = get_process_path_from_hwnd(phwnd);
+            let window_title = get_window_title(phwnd);
+            info!("Z-order search: Window {} handle: {:?}, title: '{}', exe: {}", i, phwnd, window_title, window_exe);
+
+            // Check if this window is visible and not minimized
+            if !IsWindowVisible(phwnd).as_bool() {
+                info!("Z-order search: Window {} is not visible, skipping", i);
+                continue;
+            }
+
+            if IsIconic(phwnd).as_bool() {
+                info!("Z-order search: Window {} is minimized, skipping", i);
+                continue;
+            }
+
+            // Found the first visible, non-minimized Explorer window (latest active by Z-order)
+            info!("Z-order search: Found latest active shell window {} (title: '{}', exe: {})", i, window_title, window_exe);
+            let shell_view = shell_browser.QueryActiveShellView().unwrap();
+            target_path = get_base_location_from_shellview(shell_view);
+            info!("Got target path from Z-order search: {}", target_path);
+            break;
+        }
     }
-    info!("get_selected_file_from_explorer: {}",target_path);
+    // If foreground window is not Explorer, find the last lost focus Explorer window
+    if target_path.is_empty() {
+        info!("Foreground window is not Explorer, searching for last lost focus Explorer window");
+
+        // IShellWindows returns windows in Z-order (top to bottom)
+        // The first visible, non-minimized Explorer window that's not the foreground
+        // is the most recently active (last lost focus) Explorer window
+        for i in 0..count {
+            let variant = VARIANT::from(i);
+            let dispatch: IDispatch = shell_windows.Item(&variant)?;
+
+            let shell_browser = dispath2browser(dispatch);
+            if shell_browser.is_none() {
+                continue;
+            }
+            let shell_browser = shell_browser.unwrap();
+
+            let phwnd = shell_browser.GetWindow()?;
+            let window_exe = get_process_path_from_hwnd(phwnd);
+            let window_title = get_window_title(phwnd);
+
+            // Skip if this is the foreground window (already checked)
+            if hwnd_gfw.0 == phwnd.0 {
+                info!("Last lost focus search: Window {} is the foreground window, skipping", i);
+                continue;
+            }
+
+            // Check if window is visible and not minimized
+            if !IsWindowVisible(phwnd).as_bool() {
+                info!("Last lost focus search: Window {} (title: '{}', exe: {}) is not visible, skipping", i, window_title, window_exe);
+                continue;
+            }
+
+            if IsIconic(phwnd).as_bool() {
+                info!("Last lost focus search: Window {} (title: '{}', exe: {}) is minimized, skipping", i, window_title, window_exe);
+                continue;
+            }
+
+            // Found the last lost focus Explorer window (first in Z-order that's not foreground)
+            info!("Found last lost focus Explorer window {} (title: '{}', exe: {})", i, window_title, window_exe);
+            let shell_view = shell_browser.QueryActiveShellView().unwrap();
+            target_path = get_base_location_from_shellview(shell_view);
+            info!("Got target path from last lost focus Explorer: {}", target_path);
+            break;
+        }
+    }
+
+    info!("get_selected_file_from_explorer: <-- {}",target_path);
     Ok(target_path)
 }
 
 unsafe fn dispath2browser(dispatch: IDispatch) -> Option<IShellBrowser> {
     
     let mut service_provider: Option<IServiceProvider> = None;
-    dispatch
-        .query(
+    dispatch.query(
             &IServiceProvider::IID,
             &mut service_provider as *mut _ as *mut _,
         )
         .ok()
         .unwrap();
     if service_provider.is_none() {
+		info!("dispath2browser: service_provider.is_none");
         return None;
     }
     let shell_browser = service_provider
@@ -111,10 +254,10 @@ unsafe fn get_selected_file_path_from_shellview(shell_view: IShellView) -> Strin
         }
 
         if let Ok(display_name) = shell_item.GetDisplayName(SIGDN_FILESYSPATH) {
-            println!("display_name: {:?}", display_name);
+            info!("display_name: {:?}", display_name);
             let tmp = display_name.to_string();
             if tmp.is_err() {
-                println!("display_name error: {:?}", tmp.err());
+                info!("display_name error: {:?}", tmp.err());
                 continue;
             }
             target_path = tmp.unwrap();
@@ -126,42 +269,54 @@ unsafe fn get_selected_file_path_from_shellview(shell_view: IShellView) -> Strin
 }
 
 unsafe fn get_base_location_from_shellview(shell_view: IShellView) -> String {
+	info!("get_base_location_from_shellview -->");
     let mut base_path = String::new();
-    
+
     // Try to get the current folder from the shell view
     // We need to query for IFolderView interface to get folder information
     if let Ok(folder_view) = shell_view.cast::<windows::Win32::UI::Shell::IFolderView>() {
+        info!("Successfully cast to IFolderView");
         if let Ok(folder) = folder_view.GetFolder::<IShellItem>() {
+            info!("Successfully got folder IShellItem");
             // Try to get the file system path first
             if let Ok(display_name) = folder.GetDisplayName(SIGDN_FILESYSPATH) {
                 if let Ok(path_str) = display_name.to_string() {
+                    info!("Got FILESYSPATH: {}", path_str);
                     base_path = path_str;
                 }
             }
             // Fallback to desktop absolute parsing name
             else if let Ok(display_name) = folder.GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING) {
                 if let Ok(path_str) = display_name.to_string() {
+                    info!("Got DESKTOPABSOLUTEPARSING: {}", path_str);
                     base_path = path_str;
                 }
+            } else {
+                info!("Failed to get display name");
             }
+        } else {
+            info!("Failed to get folder from IFolderView");
         }
+    } else {
+        info!("Failed to cast to IFolderView");
     }
-    
+    info!("get_base_location_from_shellview <-- returning: {}", base_path);
     base_path
 }
 
 fn main() -> Result<()> {
 
     // Initialize logging from the configuration file
-    // log4rs::init_file("d:\\myproject\\win-dir-forwarder\\log4rs.yml", Default::default()).unwrap();
+    // log4rs::init_file("d:\\myproject\\win-dir-wsl2\\log4rs.yml", Default::default()).unwrap();
 
     // Create a custom JSON encoder
-    let json_encoder = Box::new(PatternEncoder::new("{d} [{l}] - {m}{n}"));
+    // let json_encoder = Box::new(PatternEncoder::new("{d} [{l}] - {m}{n}"));
+    let json_encoder = Box::new(PatternEncoder::new("{m}{n}"));
 
     // Create a file appender with the custom encoder
     let file_appender = FileAppender::builder()
         .encoder(json_encoder)
-        .build("d:\\myproject\\win-dir-forwarder\\logs\\log.json")
+        .build("d:\\myproject\\win-dir-wsl2\\logs\\log.txt")
         .unwrap();
 
     // Create a log configuration with the file appender
@@ -174,23 +329,74 @@ fn main() -> Result<()> {
     log4rs::init_config(config).unwrap();
 
     // Log some messages
-    info!("This is an info message.-------------->");
+    info!("This is an info message.");
     warn!("This is a warning message.");
     error!("This is an error message.");
 
-
     let result = unsafe { get_selected_file_from_explorer() };
+
     match result {
         Ok(path) => {
             info!("result is {:?} <-------------------", path);
             let wide_path: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
             unsafe {
-                MessageBoxW(None, PCWSTR(wide_path.as_ptr()), w!("Selected File"), MB_ICONINFORMATION | MB_OK);
+            // MessageBoxW(None, PCWSTR(wide_path.as_ptr()), w!("Selected File"), MB_ICONINFORMATION | MB_OK);
+            }
+
+            // Execute mintty with the selected path
+            let userprofile = env::var("USERPROFILE").unwrap_or_else(|_| String::from("C:\\Users\\Default"));
+            let executable = format!("{}\\AppData\\Local\\wsltty\\bin\\mintty.exe", userprofile);
+            let configdir = format!("{}\\AppData\\Roaming\\wsltty", userprofile);
+
+            info!("Executing: {} with path: {}", executable, path);
+
+            let mut cmd = Command::new(&executable);
+            cmd.arg("--WSL=")
+               .arg(format!("--configdir={}", configdir))
+               .arg("-");
+
+            // Set working directory to the selected path
+            cmd.current_dir(&path);
+
+            // Spawn the process without waiting for it to finish
+            match cmd.spawn() {
+                Ok(child) => {
+                    info!("Process spawned with PID: {:?}, working directory: {}", child.id(), path);
+                }
+                Err(e) => {
+                    error!("Failed to spawn process: {:?}", e);
+                }
             }
         }
         Err(e) => {
-            error!("Error getting selected file: {:?}", e);
+            // When error occurs, use home directory as fallback
+            let userprofile = env::var("USERPROFILE").unwrap_or_else(|_| String::from("C:\\Users\\Default"));
+            let executable = format!("{}\\AppData\\Local\\wsltty\\bin\\mintty.exe", userprofile);
+            let configdir = format!("{}\\AppData\\Roaming\\wsltty", userprofile);
+
+            info!("Not Found Explorer.exe Active Tab: {:?}. Using home directory: {}", e, userprofile);
+            info!("Executing: {}", executable);
+
+            let mut cmd = Command::new(&executable);
+            cmd.arg("--WSL=")
+               .arg(format!("--configdir={}", configdir))
+               .arg("-~")
+               .arg("-");
+
+            // Set working directory to home directory
+            cmd.current_dir(&userprofile);
+
+            // Spawn the process without waiting for it to finish
+            match cmd.spawn() {
+                Ok(child) => {
+                    info!("Process spawned with PID: {:?}, working directory: {}", child.id(), userprofile);
+                }
+                Err(e) => {
+                    error!("Failed to spawn process: {:?}", e);
+                }
+            }
         }
     }
+	info!("      ");
     Ok(())
 }

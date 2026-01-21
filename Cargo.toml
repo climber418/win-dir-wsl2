@@ -1,5 +1,5 @@
 [package]
-name = "explorer_selection"
+name = "win_dir_wsl2"
 version = "1.0.0"
 edition = "2021"
 
@@ -15,6 +15,7 @@ features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Console",
     "Win32_System_SystemServices",
+    "Win32_System_Threading",
 ]
 
 [dependencies]
@@ -24,5 +25,5 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 [[bin]]
-name = "win-dir-forwarder"
+name = "win-dir-wsl2"
 path = "main.rs"
