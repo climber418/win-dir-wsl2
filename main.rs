@@ -6,25 +6,23 @@ use log4rs::{append::file::FileAppender, config::{Appender, Root}, encode::patte
 
 use windows::core::{Interface, Result, w, PWSTR,Error};
 use windows::Win32::{
-    UI::WindowsAndMessaging::{GetWindow, GW_HWNDNEXT},
     System::{
         Com::{
             CoCreateInstance, CoInitializeEx, CLSCTX_LOCAL_SERVER,
-            COINIT_APARTMENTTHREADED, IServiceProvider,
+            COINIT_APARTMENTTHREADED, IServiceProvider, IDispatch,
         },
         Variant::VARIANT,
         SystemServices::SFGAO_FILESYSTEM,
-        Threading::{GetProcessId, OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_NAME_WIN32, Sleep},
+        Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_NAME_WIN32, Sleep},
     },
     UI::Shell::{
-        IShellBrowser, IShellWindows, IShellView, IShellItem, IFolderView,
+        IShellBrowser, IShellWindows, IShellView, IShellItem,
         ShellWindows, SIGDN_FILESYSPATH, SIGDN_DESKTOPABSOLUTEPARSING, SVGIO_SELECTION,
-        IShellItemArray
+        IShellItemArray, SHGetKnownFolderPath, FOLDERID_Desktop, KNOWN_FOLDER_FLAG
     },
-    UI::WindowsAndMessaging::{GetForegroundWindow, FindWindowExW, MessageBoxW, MB_ICONINFORMATION, MB_OK, IsWindowVisible, IsIconic, GetWindowThreadProcessId, GetWindowTextW},
+    UI::WindowsAndMessaging::{GetForegroundWindow, FindWindowExW,
+         GetWindowThreadProcessId, GetWindowTextW, GetClassNameW},
 };
-use windows::core::PCWSTR;
-use windows::Win32::System::Com::IDispatch;
 use std::process::Command;
 use std::env;
 
@@ -51,7 +49,7 @@ unsafe fn get_process_path_from_hwnd(hwnd: windows::Win32::Foundation::HWND) -> 
     if let Ok(handle) = process_handle {
         let mut buffer: [u16; 1024] = [0; 1024];
         let mut size: u32 = buffer.len() as u32;
-        let mut pwstr = PWSTR(buffer.as_mut_ptr());
+        let pwstr = PWSTR(buffer.as_mut_ptr());
 
         if QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, pwstr, &mut size).is_ok() {
             let path = String::from_utf16_lossy(&buffer[0..size as usize]);
@@ -77,6 +75,7 @@ unsafe fn get_selected_file_from_explorer() -> Result<String> {
         let foreground_exe = get_process_path_from_hwnd(foreground_hwnd);
         let foreground_title = get_window_title(foreground_hwnd);
         info!("After sleep, foreground window handle: {:?}, title: '{}', exe: {}", foreground_hwnd, foreground_title, foreground_exe);
+
         if !foreground_exe.to_lowercase ().ends_with("\\explorer.exe") {
             return Result::Err(Error::from_win32());
         }
@@ -124,7 +123,20 @@ unsafe fn get_selected_file_from_explorer() -> Result<String> {
         }
         info!("get_selected_file_from_explorer: <-- {}",target_path);
         return Ok(target_path);
-    } 
+    } else {
+        // Check if foreground window is desktop window (Progman or WorkerW)
+        let mut class_name = [0u16; 256];
+        let len = GetClassNameW(foreground_hwnd, &mut class_name);
+        if len > 0 {
+            let class_str = String::from_utf16_lossy(&class_name[0..len as usize]);
+            info!("Foreground window class name: {}", class_str);
+            if class_str == "Progman" || class_str == "WorkerW" {
+                info!("Foreground window is Desktop, returning desktop path");
+                let desktop_path = SHGetKnownFolderPath(&FOLDERID_Desktop, KNOWN_FOLDER_FLAG(0), None)?.to_string()?;
+                return Ok(desktop_path);
+            }
+        }
+    }
 
     return Result::Err(Error::from_win32());
 }
@@ -265,10 +277,6 @@ fn main() -> Result<()> {
     match result {
         Ok(path) => {
             info!("result is {:?} <-------------------", path);
-            let wide_path: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
-            unsafe {
-            // MessageBoxW(None, PCWSTR(wide_path.as_ptr()), w!("Selected File"), MB_ICONINFORMATION | MB_OK);
-            }
 
             // Execute mintty with the selected path
             let userprofile = env::var("USERPROFILE").unwrap_or_else(|_| String::from("C:\\Users\\Default"));
