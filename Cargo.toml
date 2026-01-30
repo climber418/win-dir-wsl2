@@ -18,6 +18,9 @@ features = [
     "Win32_System_Threading",
 ]
 
+[build-dependencies]
+embed-resource = "3"
+
 [dependencies]
 log4rs = "1.0"
 log = "0.4"

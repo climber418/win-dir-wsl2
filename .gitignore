@@ -11,6 +11,7 @@ Cargo.lock
 Thumbs.db
 
 # Logs
+/logs/
 *.log
 log.json
 

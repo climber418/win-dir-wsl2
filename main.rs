@@ -287,6 +287,7 @@ fn main() -> Result<()> {
 
             let mut cmd = Command::new(&executable);
             cmd.arg("--WSL=")
+			   .arg("--icon=d:\\nutstore\\private\\bin\\ubuntu.ico")
                .arg(format!("--configdir={}", configdir))
                .arg("-");
 
@@ -314,6 +315,7 @@ fn main() -> Result<()> {
 
             let mut cmd = Command::new(&executable);
             cmd.arg("--WSL=")
+			   .arg("--icon=d:\\nutstore\\private\\bin\\ubuntu.ico")
                .arg(format!("--configdir={}", configdir))
                .arg("-~")
                .arg("-");
